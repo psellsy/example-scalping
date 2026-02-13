@@ -818,6 +818,9 @@ class ImprovedScalper:
     def _close_position(self, reason: str):
         """Close position at market."""
         self._cancel_server_orders()
+        # Wait for Alpaca to release shares held by cancelled SL/TP orders
+        import time
+        time.sleep(2)
         self._exit_reason = reason
         side = OrderSide.SELL if self._direction == "long" else OrderSide.BUY
         qty = self._shares
@@ -865,6 +868,8 @@ class ImprovedScalper:
     def _close_position_limit(self, price: float, reason: str):
         """Close position at limit price."""
         self._cancel_server_orders()
+        import time
+        time.sleep(2)
         self._exit_reason = reason
         side = OrderSide.SELL if self._direction == "long" else OrderSide.BUY
         qty = self._shares
@@ -991,6 +996,7 @@ class ImprovedScalper:
         self._best_price = 0.0
         self._entry_time = None
         self._exit_reason = None
+        self._close_retries = 0
 
     # ── Reconciliation helpers ──────────────────────────────────────────
 
@@ -1264,8 +1270,17 @@ class ImprovedScalper:
             # TIMEOUT: stuck in CLOSING for > 2 minutes — cancel and force market close
             if self._closing_since and (now - self._closing_since) > pd.Timedelta("2 min"):
                 elapsed = (now - self._closing_since).total_seconds()
+                self._close_retries = getattr(self, "_close_retries", 0) + 1
+                if self._close_retries > 3:
+                    self._l.error(
+                        f"[RECONCILE] CLOSING stuck after {self._close_retries} retries — giving up, logging as external_close"
+                    )
+                    _play_alert("error")
+                    self._log_exit(self._entry_price, "stuck_close_abandoned")
+                    self._reset_position()
+                    return
                 self._l.warning(
-                    f"[RECONCILE] CLOSING stuck for {elapsed:.0f}s — cancelling order and forcing market close"
+                    f"[RECONCILE] CLOSING stuck for {elapsed:.0f}s (retry {self._close_retries}/3) — cancelling order and forcing market close"
                 )
                 _play_alert("warning")
                 # Cancel the stale close order
@@ -1276,6 +1291,22 @@ class ImprovedScalper:
                     except Exception:
                         pass  # May already be gone
                     self._close_order_id = None
+                # Cancel ALL open orders for THIS symbol to release held shares
+                try:
+                    from alpaca.trading.requests import GetOrdersRequest
+                    from alpaca.trading.enums import QueryOrderStatus
+                    open_orders = self._client.get_orders(
+                        filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[self._symbol])
+                    )
+                    for o in open_orders:
+                        try:
+                            self._client.cancel_order_by_id(str(o.id))
+                        except Exception:
+                            pass
+                    if open_orders:
+                        self._l.info(f"Cancelled {len(open_orders)} open orders for {self._symbol}")
+                except Exception as e:
+                    self._l.warning(f"Failed to cancel orders for {self._symbol}: {e}")
                 # Revert to active state and force a new market close
                 self._state = "LONG" if self._direction == "long" else "SHORT"
                 self._close_position(self._exit_reason or "timeout_retry")

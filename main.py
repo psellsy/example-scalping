@@ -856,10 +856,16 @@ class ImprovedScalper:
                 if self._direction == "long":
                     self._tp_price = filled_price * (1 + self._cfg.tp_pct)
                     self._sl_price = filled_price * (1 - self._cfg.sl_pct)
+                    # Ensure SL is at least 1 tick below entry (prevents rounding to same price)
+                    if round(self._sl_price, 2) >= round(filled_price, 2):
+                        self._sl_price = filled_price - 0.01
                     self._state = "LONG"
                 else:
                     self._tp_price = filled_price * (1 - self._cfg.tp_pct)
                     self._sl_price = filled_price * (1 + self._cfg.sl_pct)
+                    # Ensure SL is at least 1 tick above entry (prevents rounding to same price)
+                    if round(self._sl_price, 2) <= round(filled_price, 2):
+                        self._sl_price = filled_price + 0.01
                     self._state = "SHORT"
                 self._pending_order_id = None
                 self._best_price = filled_price  # Initialize trailing stop tracker
@@ -981,11 +987,15 @@ class ImprovedScalper:
             self._direction = "long"
             self._tp_price = avg_entry * (1 + self._cfg.tp_pct)
             self._sl_price = avg_entry * (1 - self._cfg.sl_pct)
+            if round(self._sl_price, 2) >= round(avg_entry, 2):
+                self._sl_price = avg_entry - 0.01
             self._state = "LONG"
         else:
             self._direction = "short"
             self._tp_price = avg_entry * (1 - self._cfg.tp_pct)
             self._sl_price = avg_entry * (1 + self._cfg.sl_pct)
+            if round(self._sl_price, 2) <= round(avg_entry, 2):
+                self._sl_price = avg_entry + 0.01
             self._state = "SHORT"
         _slot_tracker.acquire(self._symbol)
         self._pending_order_id = None

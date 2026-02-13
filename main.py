@@ -177,6 +177,9 @@ class Config:
     rsi_cross_level: float = 40.0   # Long: RSI crossing UP above this
     rsi_short_level: float = 60.0   # Short: RSI crossing DOWN below this
     vol_threshold: float = 1.5  # Volume > Nx average
+    # Trailing stop
+    trail_activate_pct: float = 0.0  # 0 = disabled. e.g. 0.003 = activate after +0.3%
+    trail_distance_pct: float = 0.003  # Trail distance from best price (e.g. 0.003 = 0.3%)
     # Risk management
     daily_loss_pct: float = 0.01  # Stop after -1% daily loss
     max_daily_trades: int = 5
@@ -217,6 +220,8 @@ STOCK_PARAMS = {
 # Futures ETF params (same as futures — backtested on 5 years of hourly data)
 # Top 25 from 130-ETF screening — all profitable, 97% win rate across universe
 ETF_PARAMS = FUTURES_PARAMS.copy()  # Same params, different symbols
+ETF_PARAMS["trail_activate_pct"] = 0.003  # Activate trailing stop after +0.3%
+ETF_PARAMS["trail_distance_pct"] = 0.003  # Trail 0.3% behind best price
 
 ETF_SYMBOLS = {
     # Top 10 (original)
@@ -320,6 +325,7 @@ class ImprovedScalper:
         self._sl_order_id = None     # Server-side stop loss order
         self._tp_order_id = None     # Server-side take profit order
         self._closing_since: pd.Timestamp | None = None  # When CLOSING state began
+        self._best_price: float = 0.0  # Best price since entry (for trailing stop)
 
         # Daily tracking
         self._daily_pnl = 0.0
@@ -456,6 +462,8 @@ class ImprovedScalper:
             if t >= cfg.eod_liquidation:
                 self._close_position("long_eod")
                 return
+            # Update trailing stop before checking SL
+            self._update_trailing_stop(bar.high)
             if bar.low <= self._sl_price:
                 self._close_position("long_stop_loss")
                 return
@@ -469,6 +477,8 @@ class ImprovedScalper:
             if t >= cfg.eod_liquidation:
                 self._close_position("short_eod")
                 return
+            # Update trailing stop before checking SL
+            self._update_trailing_stop(bar.low)
             if bar.high >= self._sl_price:
                 self._close_position("short_stop_loss")
                 return
@@ -581,6 +591,68 @@ class ImprovedScalper:
             )
         except Exception as e:
             self._l.error(f"{direction} entry failed: {e}")
+
+    def _update_trailing_stop(self, extreme_price: float):
+        """Ratchet the stop loss toward price when trailing stop is active.
+        For longs: extreme_price = bar.high. For shorts: extreme_price = bar.low.
+        Only moves the SL in the favorable direction (never widens the stop)."""
+        cfg = self._cfg
+        if cfg.trail_activate_pct <= 0:
+            return  # Trailing stop disabled
+
+        # Update best price
+        if self._direction == "long":
+            if extreme_price > self._best_price:
+                self._best_price = extreme_price
+        else:  # short
+            if self._best_price == 0 or extreme_price < self._best_price:
+                self._best_price = extreme_price
+
+        # Check if trailing stop has been activated
+        if self._direction == "long":
+            move_pct = (self._best_price - self._entry_price) / self._entry_price
+        else:
+            move_pct = (self._entry_price - self._best_price) / self._entry_price
+
+        if move_pct < cfg.trail_activate_pct:
+            return  # Not yet activated
+
+        # Compute the trailing SL
+        if self._direction == "long":
+            trail_sl = self._best_price * (1 - cfg.trail_distance_pct)
+        else:
+            trail_sl = self._best_price * (1 + cfg.trail_distance_pct)
+
+        # Only ratchet in the protective direction (never widen)
+        if self._direction == "long":
+            if trail_sl <= self._sl_price:
+                return  # New trail SL is worse than current — skip
+            old_sl = self._sl_price
+            self._sl_price = trail_sl
+        else:
+            if trail_sl >= self._sl_price:
+                return  # New trail SL is worse than current — skip
+            old_sl = self._sl_price
+            self._sl_price = trail_sl
+
+        self._l.info(
+            f"TRAIL SL: {self._direction.upper()} best=${self._best_price:.2f} "
+            f"SL ${old_sl:.2f} → ${self._sl_price:.2f} "
+            f"(+{move_pct*100:.2f}% from entry)"
+        )
+
+        # Update the server-side stop order on Alpaca
+        self._replace_server_stop()
+
+    def _replace_server_stop(self):
+        """Cancel existing server SL and resubmit at the new (trailed) price."""
+        if self._sl_order_id:
+            try:
+                self._client.cancel_order_by_id(str(self._sl_order_id))
+            except Exception:
+                pass
+            self._sl_order_id = None
+        self._submit_server_stop()
 
     def _submit_server_stop(self):
         """Submit a server-side stop loss order to Alpaca after entry fill.
@@ -790,6 +862,7 @@ class ImprovedScalper:
                     self._sl_price = filled_price * (1 + self._cfg.sl_pct)
                     self._state = "SHORT"
                 self._pending_order_id = None
+                self._best_price = filled_price  # Initialize trailing stop tracker
 
                 unit = "contracts" if self._is_futures else "shares"
                 self._l.info(
@@ -857,6 +930,7 @@ class ImprovedScalper:
         self._sl_order_id = None
         self._tp_order_id = None
         self._closing_since = None
+        self._best_price = 0.0
         self._entry_time = None
         self._exit_reason = None
 
@@ -901,6 +975,7 @@ class ImprovedScalper:
         """Sync internal state to match a broker-confirmed position."""
         self._entry_price = avg_entry
         self._shares = abs(qty)
+        self._best_price = avg_entry  # Conservative: assume no movement yet
         self._entry_time = self._entry_time or datetime.now().isoformat()
         if qty > 0:
             self._direction = "long"

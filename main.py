@@ -592,6 +592,18 @@ class ImprovedScalper:
         if not _slot_tracker.has_free_slot():
             self._l.info(f"Skipping {direction}: {_slot_tracker.open_count}/{_slot_tracker.max_slots} slots full")
             return
+        # SAFETY: check Alpaca for existing position on this symbol before opening
+        # This prevents stacking if internal state gets out of sync with broker
+        try:
+            existing = self._client.get_open_position(self._symbol)
+            if existing and abs(int(existing.qty)) > 0:
+                self._l.warning(
+                    f"BLOCKED entry: broker already has {existing.qty} {self._symbol} "
+                    f"(side={existing.side}) — refusing to stack"
+                )
+                return
+        except Exception:
+            pass  # No position exists — safe to proceed
         if self._is_futures:
             qty = self._contracts
         else:
@@ -601,7 +613,9 @@ class ImprovedScalper:
                     acct = self._client.get_account()
                     equity = float(acct.equity)
                     buying_power = float(acct.buying_power)
-                    lot = equity * self._cfg.compound_pct
+                    # Divide compound allocation evenly across max_slots
+                    slots = max(_slot_tracker.max_slots, 1)
+                    lot = (equity * self._cfg.compound_pct) / slots
                     # Cap at available buying power (leave 5% buffer)
                     max_lot = buying_power * 0.95
                     if lot > max_lot:
@@ -610,7 +624,7 @@ class ImprovedScalper:
                     if lot < price:
                         self._l.info(f"Skipping: lot ${lot:,.0f} < price ${price:.2f}")
                         return
-                    self._l.info(f"Compound: {self._cfg.compound_pct*100:.0f}% of ${equity:,.0f} = ${lot:,.0f} lot (BP: ${buying_power:,.0f})")
+                    self._l.info(f"Compound: {self._cfg.compound_pct*100:.0f}% of ${equity:,.0f} / {slots} slots = ${lot:,.0f} lot (BP: ${buying_power:,.0f})")
                 except Exception as e:
                     lot = self._cfg.lot
                     self._l.warning(f"Compound equity fetch failed ({e}), using fixed ${lot:,.0f}")
@@ -1334,9 +1348,13 @@ class ImprovedScalper:
                             return
                     except Exception:
                         pass
-                # Unknown exit — log with zero exit price
+                # Guard: on_trade_update may have already handled this while we were checking
+                if self._state not in ("LONG", "SHORT") or self._entry_price == 0.0:
+                    self._l.info(f"[RECONCILE] Already handled by trade update — skipping duplicate log")
+                    return
+                # Unknown exit — log with entry price as exit (P&L=0 since we don't know the price)
                 self._l.warning(f"[RECONCILE] External close detected — logging as external_close")
-                self._log_exit(self._entry_price, "external_close")  # P&L=0 since we don't know the price
+                self._log_exit(self._entry_price, "external_close")
                 self._reset_position()
                 return
 

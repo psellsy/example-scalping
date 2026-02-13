@@ -1065,10 +1065,15 @@ class ImprovedScalper:
         )
 
     def _get_broker_position(self):
-        """Query Alpaca for current position. Returns (qty, avg_entry) or None."""
+        """Query Alpaca for current position. Returns (signed_qty, avg_entry) or None.
+        Uses pos.side to determine sign — pos.qty is always positive in alpaca-py."""
         try:
             pos = self._client.get_open_position(self._symbol)
-            return int(pos.qty), float(pos.avg_entry_price)
+            qty = abs(int(pos.qty))
+            side = str(pos.side).lower()
+            if "short" in side:
+                qty = -qty
+            return qty, float(pos.avg_entry_price)
         except Exception:
             return None  # No position on broker
 

@@ -1288,7 +1288,23 @@ class ImprovedScalper:
                 self._reset_position()
                 return
 
-            # Position still exists — close order may have failed
+            # SAFETY: check if the position has REVERSED direction (close order over-executed)
+            # e.g. was LONG 492, close SELL filled, but extra retries flipped us SHORT
+            actual_qty, actual_price = broker_pos
+            is_long_on_broker = actual_qty > 0
+            expected_long = self._direction == "long"
+            if is_long_on_broker != expected_long:
+                self._l.error(
+                    f"[RECONCILE] Position REVERSED! Expected {self._direction} but broker shows "
+                    f"{'LONG' if is_long_on_broker else 'SHORT'} {abs(actual_qty)} — "
+                    f"close over-executed. Resetting (orphan adoption will handle reversed position)"
+                )
+                _play_alert("error")
+                self._log_exit(self._entry_price, "close_over_executed")
+                self._reset_position()
+                return
+
+            # Position still exists in expected direction — close order may have failed
             if self._close_order_id:
                 try:
                     order = self._client.get_order_by_id(str(self._close_order_id))
@@ -1296,6 +1312,8 @@ class ImprovedScalper:
                     if status in ("canceled", "cancelled", "expired", "rejected"):
                         self._l.warning(f"Close order {status} — retrying market close")
                         self._close_order_id = None
+                        # Update shares to actual broker qty (may have partially closed)
+                        self._shares = abs(actual_qty)
                         self._state = "LONG" if self._direction == "long" else "SHORT"
                         self._close_position(self._exit_reason or "retry_close")
                         return
@@ -1342,7 +1360,25 @@ class ImprovedScalper:
                         self._l.info(f"Cancelled {len(open_orders)} open orders for {self._symbol}")
                 except Exception as e:
                     self._l.warning(f"Failed to cancel orders for {self._symbol}: {e}")
-                # Revert to active state and force a new market close
+                # Re-check broker position AFTER cancelling (position may have changed)
+                broker_pos_fresh = self._get_broker_position()
+                if broker_pos_fresh is None:
+                    self._l.info(f"[RECONCILE] Position gone after cancelling orders — close completed")
+                    self._log_exit(self._entry_price, self._exit_reason or "close_confirmed")
+                    self._reset_position()
+                    return
+                fresh_qty, _ = broker_pos_fresh
+                if (fresh_qty > 0) != expected_long:
+                    self._l.error(
+                        f"[RECONCILE] Position REVERSED after cancel! "
+                        f"{'LONG' if fresh_qty > 0 else 'SHORT'} {abs(fresh_qty)} — resetting"
+                    )
+                    _play_alert("error")
+                    self._log_exit(self._entry_price, "close_over_executed")
+                    self._reset_position()
+                    return
+                # Update shares to actual remaining qty and retry close
+                self._shares = abs(fresh_qty)
                 self._state = "LONG" if self._direction == "long" else "SHORT"
                 self._close_position(self._exit_reason or "timeout_retry")
             return
@@ -1559,6 +1595,67 @@ def main(args):
         logger.info(f"  Bar cache: empty, {needed}-bar warmup required")
     logger.info(f"{'='*60}")
 
+    # Monkey-patch _run_forever to add backoff on connection errors.
+    # The SDK catches ValueError internally and retries instantly (no sleep),
+    # causing a tight loop on "connection limit exceeded". We inject a delay.
+    _original_run_forever = stream._run_forever.__func__  # unbound method
+
+    async def _patched_run_forever(self):
+        _conn_fails = 0
+        if not self._handlers:
+            log = logging.getLogger("alpaca.data.live.websocket")
+            log.warning("no handlers registered, skipping stream")
+            return
+        await asyncio.sleep(0)
+        log = logging.getLogger("alpaca.data.live.websocket")
+        log.info(f"started {self._name} stream")
+        self._should_run = True
+        self._running = False
+        while True:
+            try:
+                if not self._should_run:
+                    log.info(f"{self._name} stream stopped")
+                    return
+                if not self._running:
+                    log.info(f"starting {self._name} websocket connection")
+                    await self._start_ws()
+                    await self._send_subscribe_msg()
+                    self._running = True
+                    _conn_fails = 0  # Reset on successful connect
+                await self._consume()
+            except Exception as e:
+                import websockets
+                is_conn_limit = isinstance(e, ValueError) and "connection limit" in str(e).lower()
+                is_insufficient = isinstance(e, ValueError) and "insufficient subscription" in str(e)
+                is_ws_error = isinstance(e, websockets.WebSocketException)
+
+                if is_insufficient:
+                    await self.close()
+                    self._running = False
+                    log.exception(f"error during websocket communication: {e}")
+                    return
+
+                if is_ws_error:
+                    await self.close()
+                    self._running = False
+                    log.warning(f"data websocket error, restarting connection: {e}")
+                elif is_conn_limit:
+                    _conn_fails += 1
+                    delay = min(30 * (2 ** min(_conn_fails - 1, 4)), 300)
+                    log.warning(
+                        f"Connection limit exceeded (attempt {_conn_fails}). "
+                        f"Waiting {delay}s before retry..."
+                    )
+                    self._running = False
+                    await asyncio.sleep(delay)
+                else:
+                    log.exception(f"error during websocket communication: {e}")
+            finally:
+                await asyncio.sleep(0)
+
+    import types
+    stream._run_forever = types.MethodType(_patched_run_forever, stream)
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(asyncio.gather(
@@ -1597,6 +1694,14 @@ if __name__ == "__main__":
     fh.setLevel(logging.INFO)
     fh.setFormatter(et_formatter)
     logger.addHandler(fh)
+
+    # Separate error log — WARNING and above only
+    eh = logging.FileHandler("errors.log")
+    eh.setLevel(logging.WARNING)
+    eh.setFormatter(et_formatter)
+    logger.addHandler(eh)
+    # Also capture warnings/errors from alpaca SDK and other libraries
+    logging.getLogger().addHandler(eh)
 
     # Audio alert on errors (rate-limited to 1 per 30s)
     logger.addHandler(AudioAlertHandler())

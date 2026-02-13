@@ -519,6 +519,9 @@ class ImprovedScalper:
             # Update trailing stop before checking SL
             self._update_trailing_stop(bar.high)
             if bar.low <= self._sl_price:
+                # Guard: check if server SL already filled before software SL fires
+                if self._server_sl_already_filled():
+                    return
                 self._close_position("long_stop_loss")
                 return
             if bar.high >= self._tp_price:
@@ -534,6 +537,9 @@ class ImprovedScalper:
             # Update trailing stop before checking SL
             self._update_trailing_stop(bar.low)
             if bar.high >= self._sl_price:
+                # Guard: check if server SL already filled before software SL fires
+                if self._server_sl_already_filled():
+                    return
                 self._close_position("short_stop_loss")
                 return
             if bar.low <= self._tp_price:
@@ -811,6 +817,32 @@ class ImprovedScalper:
             else:
                 self._l.debug(f"Server TP still unavailable — software TP active")
 
+    def _server_sl_already_filled(self) -> bool:
+        """Check if the server-side SL order has already filled.
+
+        Called before software SL fires to avoid double-closing:
+        both server SL and software SL trigger at the same price,
+        and if both submit close orders the position reverses.
+        """
+        if not self._sl_order_id:
+            return False
+        try:
+            order = self._client.get_order_by_id(str(self._sl_order_id))
+            status = str(order.status).lower()
+            if status == "filled":
+                exit_price = float(order.filled_avg_price or 0)
+                self._l.info(
+                    f"Server SL already FILLED @ ${exit_price:.2f} — "
+                    f"skipping software SL (reconcile will handle exit)"
+                )
+                return True
+            if status in ("partially_filled",):
+                self._l.info(f"Server SL partially filled — skipping software SL")
+                return True
+        except Exception as e:
+            self._l.debug(f"Server SL check failed: {e}")
+        return False
+
     def _cancel_server_orders(self):
         """Cancel server-side SL and TP orders before we close via our own logic."""
         if self._sl_order_id:
@@ -844,6 +876,31 @@ class ImprovedScalper:
         self._cancel_server_orders()
         # Wait for Alpaca to release shares held by cancelled SL/TP orders
         time.sleep(2)
+
+        # SAFETY: verify the position still exists on broker before submitting close
+        broker_pos = self._get_broker_position()
+        if broker_pos is None:
+            self._l.info(f"Position already gone on broker — skipping close ({reason})")
+            self._log_exit(self._entry_price, reason)
+            self._reset_position()
+            return
+        actual_qty, _ = broker_pos
+        is_long_on_broker = actual_qty > 0
+        expected_long = self._direction == "long"
+        if is_long_on_broker != expected_long:
+            self._l.error(
+                f"Position REVERSED on broker before close! Expected {self._direction}, "
+                f"got {'LONG' if is_long_on_broker else 'SHORT'} {abs(actual_qty)} — aborting close"
+            )
+            self._log_exit(self._entry_price, "close_aborted_reversed")
+            self._reset_position()
+            return
+        # Use actual broker qty (may differ from self._shares if server SL partially filled)
+        actual_shares = abs(actual_qty)
+        if actual_shares != self._shares:
+            self._l.info(f"Adjusting close qty: {self._shares} → {actual_shares} (broker actual)")
+            self._shares = actual_shares
+
         self._exit_reason = reason
         side = OrderSide.SELL if self._direction == "long" else OrderSide.BUY
         qty = self._shares

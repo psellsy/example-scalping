@@ -658,7 +658,11 @@ class ImprovedScalper:
                 f"Slots: {_slot_tracker.open_count}/{_slot_tracker.max_slots}"
             )
         except Exception as e:
-            self._l.error(f"{direction} entry failed: {e}")
+            err = str(e)
+            if "cannot be sold short" in err or "not shortable" in err:
+                self._l.info(f"{self._symbol} not shortable on Alpaca — skipping")
+            else:
+                self._l.error(f"{direction} entry failed: {e}")
 
     def _update_trailing_stop(self, extreme_price: float):
         """Ratchet the stop loss toward price when trailing stop is active.

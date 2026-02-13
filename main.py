@@ -19,6 +19,7 @@ Usage:
 import os
 import sys
 import json
+import time
 import yaml
 import asyncio
 import logging
@@ -77,8 +78,7 @@ class AudioAlertHandler(logging.Handler):
         self._last_alert = 0.0
 
     def emit(self, record):
-        import time as _time
-        now = _time.time()
+        now = time.time()
         if now - self._last_alert > 30:  # Max one alert per 30 seconds
             self._last_alert = now
             _play_alert("error")
@@ -376,6 +376,8 @@ class ImprovedScalper:
         self._close_order_id = None
         self._sl_order_id = None     # Server-side stop loss order
         self._tp_order_id = None     # Server-side take profit order
+        self._tp_server_failed = False  # True if server TP failed (SL holds all qty) — skip retries
+        self._last_exit_ts: float = 0.0  # Timestamp of last exit log (prevents duplicates)
         self._closing_since: pd.Timestamp | None = None  # When CLOSING state began
         self._best_price: float = 0.0  # Best price since entry (for trailing stop)
 
@@ -799,7 +801,11 @@ class ImprovedScalper:
             tif_label = "DAY" if is_fractional else "GTC"
             self._l.info(f"SERVER TP: {side.name} {qty} @ ${self._tp_price:.2f} [{tif_label}] (order {order.id})")
         except Exception as e:
-            self._l.error(f"Server TP failed: {e} — software TP only!")
+            if not self._tp_server_failed:
+                self._l.info(f"Server TP unavailable (SL holds qty) — software TP only")
+                self._tp_server_failed = True
+            else:
+                self._l.debug(f"Server TP still unavailable — software TP active")
 
     def _cancel_server_orders(self):
         """Cancel server-side SL and TP orders before we close via our own logic."""
@@ -833,7 +839,6 @@ class ImprovedScalper:
         """Close position at market."""
         self._cancel_server_orders()
         # Wait for Alpaca to release shares held by cancelled SL/TP orders
-        import time
         time.sleep(2)
         self._exit_reason = reason
         side = OrderSide.SELL if self._direction == "long" else OrderSide.BUY
@@ -882,7 +887,6 @@ class ImprovedScalper:
     def _close_position_limit(self, price: float, reason: str):
         """Close position at limit price."""
         self._cancel_server_orders()
-        import time
         time.sleep(2)
         self._exit_reason = reason
         side = OrderSide.SELL if self._direction == "long" else OrderSide.BUY
@@ -1006,6 +1010,7 @@ class ImprovedScalper:
         self._close_order_id = None
         self._sl_order_id = None
         self._tp_order_id = None
+        self._tp_server_failed = False
         self._closing_since = None
         self._best_price = 0.0
         self._entry_time = None
@@ -1016,6 +1021,13 @@ class ImprovedScalper:
 
     def _log_exit(self, exit_price: float, reason: str):
         """Record a completed trade — single place for P&L accounting + trade log."""
+        # Duplicate-exit guard: skip if an exit was already logged within 10s
+        # (prevents double-logging from reconcile/trade_update race condition)
+        now = time.time()
+        if (now - self._last_exit_ts) < 10:
+            self._l.debug(f"Skipping duplicate exit log ({reason}) — already logged {now - self._last_exit_ts:.1f}s ago")
+            return
+        self._last_exit_ts = now
         pnl = self._calc_pnl(exit_price)
         self._daily_pnl += pnl
         self._daily_trades += 1
@@ -1193,7 +1205,7 @@ class ImprovedScalper:
             except Exception as e:
                 self._l.warning(f"Failed to discover existing TP orders: {e}")
 
-        if not tp_ok:
+        if not tp_ok and not self._tp_server_failed:
             self._submit_server_tp()
 
     # ── Main reconciliation loop ─────────────────────────────────────
